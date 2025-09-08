@@ -1,0 +1,252 @@
+name: Mobile Apps CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'apps/bakir-io-ios/**'
+      - 'apps/bakir-io-android/**'
+      - '.github/workflows/mobile-ci-cd.yml'
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'apps/bakir-io-ios/**'
+      - 'apps/bakir-io-android/**'
+  workflow_dispatch:
+    inputs:
+      build_ios:
+        description: 'Build iOS app'
+        type: boolean
+        default: true
+      build_android:
+        description: 'Build Android app'
+        type: boolean
+        default: true
+      skip_deploy:
+        description: 'Skip deployment to stores'
+        type: boolean
+        default: false
+
+env:
+  JAVA_VERSION: '17'
+  XCODE_VERSION: '15.2'
+  IOS_VERSION: '17.2'
+
+jobs:
+  detect-changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      ios_changed: ${{ steps.changes.outputs.ios }}
+      android_changed: ${{ steps.changes.outputs.android }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes
+        uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            ios:
+              - 'apps/bakir-io-ios/**'
+            android:
+              - 'apps/bakir-io-android/**'
+
+  build-ios:
+    name: Build iOS App
+    needs: detect-changes
+    if: needs.detect-changes.outputs.ios_changed == 'true' || github.event.inputs.build_ios == 'true'
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Setup Ruby for Fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+          working-directory: ./apps/bakir-io-ios
+
+      - name: Cache derived data
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Developer/Xcode/DerivedData
+          key: ${{ runner.os }}-derived-data-${{ hashFiles('**/project.pbxproj') }}
+
+      - name: Install dependencies
+        working-directory: ./apps/bakir-io-ios
+        run: |
+          gem install bundler
+          bundle install
+
+      - name: Run tests
+        working-directory: ./apps/bakir-io-ios
+        run: |
+          set -o pipefail
+          xcodebuild -scheme BakirIO \
+            -destination 'platform=iOS Simulator,name=iPhone 15,OS=${{ env.IOS_VERSION }}' \
+            -configuration Debug \
+            clean test \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcpretty
+
+      - name: SwiftLint
+        working-directory: ./apps/bakir-io-ios
+        run: |
+          if which swiftlint >/dev/null; then
+            swiftlint --reporter github-actions-logging
+          else
+            echo "SwiftLint not installed, skipping..."
+          fi
+
+      - name: Build for release (if not PR)
+        if: github.event_name != 'pull_request' && github.event.inputs.skip_deploy != 'true'
+        working-directory: ./apps/bakir-io-ios
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+        run: |
+          mkdir -p ~/.appstoreconnect
+          echo "$APP_STORE_CONNECT_API_KEY" | base64 --decode > ~/.appstoreconnect/AuthKey_$APP_STORE_CONNECT_API_KEY_ID.p8
+          bundle exec fastlane beta
+
+  build-android:
+    name: Build Android App
+    needs: detect-changes
+    if: needs.detect-changes.outputs.android_changed == 'true' || github.event.inputs.build_android == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+
+      - name: Make gradlew executable
+        working-directory: ./apps/bakir-io-android
+        run: chmod +x ./gradlew
+
+      - name: Run lint
+        working-directory: ./apps/bakir-io-android
+        run: ./gradlew lintDebug
+
+      - name: Run unit tests
+        working-directory: ./apps/bakir-io-android
+        run: ./gradlew testDebugUnitTest
+
+      - name: Build debug APK
+        working-directory: ./apps/bakir-io-android
+        run: ./gradlew assembleDebug
+
+      - name: Run instrumentation tests
+        if: github.event_name != 'pull_request'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          working-directory: ./apps/bakir-io-android
+          api-level: 29
+          arch: x86_64
+          script: ./gradlew connectedDebugAndroidTest
+
+      - name: Build release (if not PR)
+        if: github.event_name != 'pull_request' && github.event.inputs.skip_deploy != 'true'
+        working-directory: ./apps/bakir-io-android
+        env:
+          KEYSTORE_FILE: ${{ secrets.KEYSTORE_FILE }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          # Create keystore file
+          echo "$KEYSTORE_FILE" | base64 --decode > ./app/release-keystore.jks
+          
+          # Create signing configuration
+          echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> ./keystore.properties
+          echo "KEY_ALIAS=$KEY_ALIAS" >> ./keystore.properties
+          echo "KEY_PASSWORD=$KEY_PASSWORD" >> ./keystore.properties
+          echo "KEYSTORE_FILE=release-keystore.jks" >> ./keystore.properties
+          
+          # Build release
+          ./gradlew bundleRelease assembleRelease
+
+  deploy-summary:
+    name: Deployment Summary
+    needs: [detect-changes, build-ios, build-android]
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create deployment summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const iosChanged = '${{ needs.detect-changes.outputs.ios_changed }}' === 'true';
+            const androidChanged = '${{ needs.detect-changes.outputs.android_changed }}' === 'true';
+            const iosBuildStatus = '${{ needs.build-ios.result }}';
+            const androidBuildStatus = '${{ needs.build-android.result }}';
+            
+            let summary = '## Mobile Apps Build Summary\n\n';
+            
+            if (iosChanged) {
+              const iosIcon = iosBuildStatus === 'success' ? '✅' : '❌';
+              summary += `${iosIcon} **iOS App**: ${iosBuildStatus}\n`;
+            } else {
+              summary += '⏭️ **iOS App**: No changes detected\n';
+            }
+            
+            if (androidChanged) {
+              const androidIcon = androidBuildStatus === 'success' ? '✅' : '❌';
+              summary += `${androidIcon} **Android App**: ${androidBuildStatus}\n`;
+            } else {
+              summary += '⏭️ **Android App**: No changes detected\n';
+            }
+            
+            if (iosBuildStatus === 'success' && iosChanged) {
+              summary += '\n📱 iOS app built and uploaded to TestFlight\n';
+            }
+            
+            if (androidBuildStatus === 'success' && androidChanged) {
+              summary += '\n🤖 Android app built and ready for Play Store\n';
+            }
+            
+            github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: summary
+            });
+
+  notify-success:
+    name: Notify Success
+    needs: [build-ios, build-android]
+    if: always() && (needs.build-ios.result == 'success' || needs.build-android.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Success notification
+        run: |
+          echo "Mobile app builds completed successfully!"
+          echo "iOS: ${{ needs.build-ios.result }}"
+          echo "Android: ${{ needs.build-android.result }}"
